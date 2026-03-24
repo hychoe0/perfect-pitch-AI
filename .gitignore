@@ -1,0 +1,25 @@
+# Python virtual environments
+catcher_env/
+pitcher_env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Statcast data cache
+perfect_pitch_cache/
+
+# Frontend dependencies & build
+frontend/node_modules/
+frontend/dist/
+
+# Environment / secrets
+.env
+*.env
+
+# macOS
+.DS_Store
