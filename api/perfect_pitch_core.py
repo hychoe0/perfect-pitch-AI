@@ -3,7 +3,8 @@ Perfect Pitch AI — Core Engine
 Extracted from perfect_pitch.ipynb for use with the FastAPI backend.
 """
 
-import warnings, os, pickle, time, json, urllib.request
+import warnings, os, pickle, time, json, urllib.request, hashlib
+import joblib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -17,8 +18,9 @@ import pybaseball
 pybaseball.cache.enable()
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, brier_score_loss
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 # ── Seasons ───────────────────────────────────────────────────────────────────
 SEASONS = {
@@ -258,7 +260,7 @@ def search_players(query: str) -> List[dict]:
                 if ql in n.lower()]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────���──────────────
 # LEVERAGE INDEX & PRESSURE METRICS
 # ─────────────────────────────────────────────────────────────────────────────
 PRESSURE_TIERS = {
@@ -745,11 +747,47 @@ class RuleEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 class PitchOutcomeModel:
 
-    def __init__(self):
+    def __init__(self, cache_dir: Optional[str] = None):
         self.model       = None
         self.feat_cols   = []
         self.is_trained  = False
         self.class_names = ['whiff', 'called_strike', 'foul', 'ball', 'in_play']
+        self.cache_dir   = cache_dir
+
+    @staticmethod
+    def _cache_key(pitcher_id: int, data_hash: str) -> str:
+        return f"pitch_model_{pitcher_id}_{data_hash}.joblib"
+
+    @staticmethod
+    def _data_hash(df: pd.DataFrame) -> str:
+        sig = f"{sorted(df.index.tolist())}_{df.shape}_{df.dtypes.to_dict()}"
+        return hashlib.md5(sig.encode()).hexdigest()[:12]
+
+    def save(self, pitcher_id: int, data_hash: str):
+        if self.cache_dir is None:
+            return
+        os.makedirs(self.cache_dir, exist_ok=True)
+        path = os.path.join(self.cache_dir, self._cache_key(pitcher_id, data_hash))
+        joblib.dump({
+            'model':       self.model,
+            'feat_cols':   self.feat_cols,
+            'class_names': getattr(self, 'class_names', []),
+        }, path)
+        print(f'  ML model saved to {path}')
+
+    @classmethod
+    def load(cls, cache_dir: str, pitcher_id: int, data_hash: str) -> Optional['PitchOutcomeModel']:
+        path = os.path.join(cache_dir, cls._cache_key(pitcher_id, data_hash))
+        try:
+            blob = joblib.load(path)
+            obj = cls(cache_dir=cache_dir)
+            obj.model       = blob['model']
+            obj.feat_cols   = blob['feat_cols']
+            obj.class_names = blob.get('class_names', ['whiff','called_strike','foul','ball','in_play'])
+            obj.is_trained  = True
+            return obj
+        except Exception:
+            return None
 
     @staticmethod
     def _col(df: pd.DataFrame, col: str, default=0) -> pd.Series:
@@ -791,6 +829,65 @@ class PitchOutcomeModel:
         d['chase_zone']     = d['zone'].isin([11,12,13,14]).astype(int)
         d['leverage']       = df.apply(compute_leverage, axis=1)
         d['postseason']     = c(df,'game_type','R').isin(POSTSEASON).astype(int)
+
+        # ── Group A: Pitch movement & release ────────────────────────────────
+        d['release_pos_x']   = pd.to_numeric(c(df,'release_pos_x',0),    errors='coerce').fillna(0)
+        d['release_pos_z']   = pd.to_numeric(c(df,'release_pos_z',6),    errors='coerce').fillna(6)
+        d['effective_speed'] = pd.to_numeric(c(df,'effective_speed',92), errors='coerce').fillna(92)
+        d['spin_axis']       = pd.to_numeric(c(df,'spin_axis',180),      errors='coerce').fillna(180)
+        d['plate_x']         = pd.to_numeric(c(df,'plate_x',0),          errors='coerce').fillna(0)
+        d['plate_z']         = pd.to_numeric(c(df,'plate_z',2.5),        errors='coerce').fillna(2.5)
+        _tmp_spd  = pd.DataFrame({'spd': d['release_speed'], 'pt': pt_col})
+        _mean_spd = _tmp_spd.groupby('pt')['spd'].transform('mean')
+        d['velo_diff_from_avg'] = (d['release_speed'] - _mean_spd).fillna(0)
+
+        # ── Group B: Platoon matchup ──────────────────────────────────────────
+        p_throws = c(df,'p_throws','R')
+        stand    = c(df,'stand','R')
+        d['pitcher_R'] = (p_throws == 'R').astype(int)
+        d['batter_R']  = (stand == 'R').astype(int)
+        d['same_hand'] = (p_throws == stand).astype(int)
+
+        # ── Group C: Sequencing features ─────────────────────────────────────
+        if 'prev_pitch_type' in df.columns:
+            # Inference path: ctx already contains prev values as columns
+            prev_pt   = c(df,'prev_pitch_type','')
+            prev_zone = pd.to_numeric(c(df,'prev_zone',0),          errors='coerce').fillna(0)
+            prev_desc = c(df,'prev_description','')
+            prev_spd  = pd.to_numeric(c(df,'prev_release_speed',0), errors='coerce').fillna(0)
+            pitch_num = pd.to_numeric(c(df,'pitch_number',1),       errors='coerce').fillna(1)
+        elif all(col in df.columns for col in ['game_pk','at_bat_number','pitch_number']):
+            # Training path: derive from within-at-bat ordering
+            _s = df.sort_values(['game_pk','at_bat_number','pitch_number'])
+            _g = _s.groupby(['game_pk','at_bat_number'])
+            prev_pt   = _g['pitch_type'].shift(1).reindex(df.index).fillna('')
+            prev_zone = pd.to_numeric(
+                _g['zone'].shift(1).reindex(df.index),          errors='coerce').fillna(0)
+            prev_desc = _g['description'].shift(1).reindex(df.index).fillna('')
+            prev_spd  = pd.to_numeric(
+                _g['release_speed'].shift(1).reindex(df.index), errors='coerce').fillna(0)
+            pitch_num = pd.to_numeric(c(df,'pitch_number',1), errors='coerce').fillna(1)
+        else:
+            prev_pt   = pd.Series('',  index=df.index)
+            prev_zone = pd.Series(0.0, index=df.index)
+            prev_desc = pd.Series('',  index=df.index)
+            prev_spd  = pd.Series(0.0, index=df.index)
+            pitch_num = pd.Series(1.0, index=df.index)
+
+        for pt in ['FF','FT','SI','FC','SL','ST','CU','CH']:
+            d[f'prev_{pt}']      = (prev_pt == pt).astype(int)
+        d['prev_zone']           = prev_zone
+        d['prev_in_zone']        = prev_zone.between(1, 9).astype(int)
+        _strike_desc = {'called_strike','swinging_strike','swinging_strike_blocked','foul','foul_tip'}
+        _ball_desc   = {'ball','blocked_ball'}
+        _whiff_desc  = {'swinging_strike','swinging_strike_blocked'}
+        d['prev_was_strike']     = prev_desc.isin(_strike_desc).astype(int)
+        d['prev_was_ball']       = prev_desc.isin(_ball_desc).astype(int)
+        d['prev_was_whiff']      = prev_desc.isin(_whiff_desc).astype(int)
+        d['velo_change']         = (d['release_speed'] - prev_spd).where(prev_spd > 0, 0).fillna(0)
+        d['same_as_prev']        = (pt_col == prev_pt).astype(int)
+        d['pitch_num_in_ab']     = pitch_num
+
         return d.fillna(0)
 
     def _target(self, df: pd.DataFrame) -> pd.Series:
@@ -803,7 +900,7 @@ class PitchOutcomeModel:
         cat[desc.str.contains('hit_into_play', na=False)]              = 4
         return cat.dropna().astype(int)
 
-    def train(self, pitcher_data: pd.DataFrame):
+    def train(self, pitcher_data: pd.DataFrame, pitcher_id: int = 0):
         df = pitcher_data[pitcher_data['pitch_type'].notna()].copy()
         print(f'  Building features for {len(df):,} pitches...')
         X = self._featurize(df)
@@ -820,12 +917,24 @@ class PitchOutcomeModel:
             max_iter=300, max_depth=6, learning_rate=0.05,
             min_samples_leaf=20, random_state=42)
         self.model.fit(X_tr, y_tr)
+        calibrated = CalibratedClassifierCV(
+            estimator=self.model, method='isotonic', cv='prefit')
+        calibrated.fit(X_te, y_te)
+        self.model = calibrated
         acc = accuracy_score(y_te, self.model.predict(X_te))
         print(f'  Test accuracy: {acc:.3f}')
+        cal_probs = self.model.predict_proba(X_te)
+        n_classes = cal_probs.shape[1]
+        brier_scores = []
+        for k in range(n_classes):
+            bs = brier_score_loss((y_te == k).astype(int), cal_probs[:, k])
+            brier_scores.append(bs)
+        print(f'  Mean Brier score: {np.mean(brier_scores):.4f}  (per-class: {", ".join(f"{self.class_names[k]}={b:.4f}" for k, b in enumerate(brier_scores))})')
         print(classification_report(y_te, self.model.predict(X_te),
                                     target_names=self.class_names, zero_division=0))
         self.feat_cols  = list(X.columns)
         self.is_trained = True
+        self.save(pitcher_id, self._data_hash(pitcher_data))
         return self
 
     def score_candidates(self, candidates: List[dict], ctx: dict) -> List[dict]:
@@ -991,10 +1100,17 @@ class PerfectPitchAI:
         bdata        = self.fetcher.get_batter_data(batter_id, batter_name)
         self.batter  = BatterProfile(batter_id, batter_name, bdata)
 
-        try:
-            self.ml.train(self._pdata)
-        except Exception as e:
-            print(f'ML training failed: {e} — rule-based only')
+        data_hash = PitchOutcomeModel._data_hash(self._pdata)
+        cached = PitchOutcomeModel.load(self.fetcher.cache_dir, pitcher_id, data_hash)
+        if cached:
+            self.ml = cached
+            print('  ML model loaded from cache')
+        else:
+            try:
+                self.ml = PitchOutcomeModel(cache_dir=self.fetcher.cache_dir)
+                self.ml.train(self._pdata, pitcher_id=pitcher_id)
+            except Exception as e:
+                print(f'ML training failed: {e} — rule-based only')
 
         self.rules = RuleEngine(self.pitcher, self.batter)
         print(f'Ready: {pitcher_name} vs {batter_name}')
@@ -1026,6 +1142,7 @@ class PerfectPitchAI:
                 rec['score'] += rt[rec['pitch_type']]['boost']
                 rec['reasons'].append(rt[rec['pitch_type']]['note'])
 
+        _last = self.ab.history[-1] if self.ab.history else None
         ctx = {'balls': self.ab.balls, 'strikes': self.ab.strikes,
                'outs_when_up': self.ab.gs.get('outs',0),
                'inning': self.ab.gs.get('inning',1),
@@ -1034,7 +1151,14 @@ class PerfectPitchAI:
                'home_score': self.ab.gs.get('home_score',0),
                'away_score': self.ab.gs.get('away_score',0),
                'game_type': self.ab.gs.get('game_type','R'),
-               'release_speed': 93}
+               'release_speed': 93,
+               'p_throws': self.pitcher.handedness,
+               'stand':    self.batter.stands,
+               'prev_pitch_type':    _last.pt       if _last else '',
+               'prev_zone':          _last.zone     if _last else 0,
+               'prev_description':   _last.result   if _last else '',
+               'prev_release_speed': _last.velocity if _last else 0,
+               'pitch_number':       self.ab.pitch_num}
         recs = self.ml.score_candidates(recs, ctx)
         for rec in recs:
             if 'ml_whiff_prob' in rec:
