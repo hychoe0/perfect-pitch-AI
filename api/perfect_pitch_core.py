@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, brier_score_loss
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
 
 # ── Seasons ───────────────────────────────────────────────────────────────────
 SEASONS = {
@@ -169,6 +170,25 @@ class StatcastDataFetcher:
         result = pd.concat(frames, ignore_index=True)
         self._save(key, result)
         return result
+
+    def get_matchup_data(self, pitcher_id: int, batter_id: int,
+                         pitcher_name: str, batter_name: str) -> Optional[pd.DataFrame]:
+        """Fetch pitch-level data for this specific pitcher vs this specific batter."""
+        cache_key = f"matchup_{pitcher_id}_{batter_id}"
+        cached = self._load(cache_key)
+        if cached is not None:
+            print(f'  [Cache] H2H {pitcher_name} vs {batter_name}: {len(cached):,} pitches')
+            return cached
+        try:
+            pitcher_data = self.get_pitcher_data(pitcher_id, pitcher_name)
+            h2h = pitcher_data[pitcher_data['batter'] == batter_id]
+            if len(h2h) > 0:
+                self._save(cache_key, h2h)
+                return h2h
+            return None
+        except Exception as e:
+            print(f'  H2H data fetch failed: {e}')
+            return None
 
 
 def lookup_player(name: str) -> Optional[int]:
@@ -401,9 +421,23 @@ def batter_pressure_profile(df: pd.DataFrame) -> dict:
     return out
 
 
-# ──────────────────────────────────────���──────────────────────────────────────
+def recency_weights(df: pd.DataFrame, recent_days: int = 30, recent_boost: float = 2.0) -> pd.Series:
+    """Return per-row weights: recent_boost for pitches in last `recent_days`, 1.0 for older."""
+    if 'game_date' not in df.columns:
+        return pd.Series(1.0, index=df.index)
+    try:
+        dates = pd.to_datetime(df['game_date'], errors='coerce')
+        cutoff = dates.max() - pd.Timedelta(days=recent_days)
+        weights = pd.Series(1.0, index=df.index)
+        weights[dates >= cutoff] = recent_boost
+        return weights
+    except Exception:
+        return pd.Series(1.0, index=df.index)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PITCHER PROFILE
-# ──────────────────────��──────────────────────────────────────────��───────────
+# ─────────────────────────────────────────────────────────────────────────────
 class PitcherProfile:
     """Comprehensive pitcher profile: repertoire, count/zone/sequence tendencies,
     and pressure splits from 2024-2025 Statcast data."""
@@ -421,24 +455,34 @@ class PitcherProfile:
         self.pressure         = pitcher_pressure_profile(data)
 
     def _repertoire(self, df):
-        rep, total = {}, len(df)
+        rep = {}
+        w = recency_weights(df)
+        w_total = w.sum()
         for pt, g in df.groupby('pitch_type'):
-            n      = len(g)
+            wg     = w.loc[g.index]
+            n_eff  = wg.sum()
             sw     = g[g['description'].isin(SWING_DESC)]
             wh     = g[g['description'].isin(WHIFF_DESC)]
             iz     = g[g['zone'].between(1,9)]
             oz     = g[g['zone'].isin([11,12,13,14])]
             chase  = oz[oz['description'].isin(SWING_DESC)]
             cstr   = g[g['description'] == 'called_strike']
+            w_sw   = wg.loc[sw.index].sum() if len(sw) > 0 else 0
+            w_wh   = wg.loc[wh.index].sum() if len(wh) > 0 else 0
+            w_iz   = wg.loc[iz.index].sum() if len(iz) > 0 else 0
+            w_oz   = wg.loc[oz.index].sum() if len(oz) > 0 else 0
+            w_ch   = wg.loc[chase.index].sum() if len(chase) > 0 else 0
+            w_cstr = wg.loc[cstr.index].sum() if len(cstr) > 0 else 0
+            velo   = g['release_speed'].dropna()
             rep[pt] = {
                 'name':       PITCH_TYPES[pt],
-                'usage_pct':  n / total * 100,
-                'count':      n,
-                'avg_velo':   float(g['release_speed'].mean()) if not g['release_speed'].isna().all() else None,
-                'whiff_rate': len(wh) / len(sw) if len(sw) > 0 else 0,
-                'zone_rate':  len(iz) / n,
-                'chase_rate': len(chase) / len(oz) if len(oz) > 0 else 0,
-                'csw_rate':   (len(cstr) + len(wh)) / n,
+                'usage_pct':  n_eff / w_total * 100,
+                'count':      len(g),
+                'avg_velo':   float(np.average(velo, weights=wg.loc[velo.index])) if len(velo) > 0 else None,
+                'whiff_rate': w_wh / w_sw if w_sw > 0 else 0,
+                'zone_rate':  w_iz / n_eff if n_eff > 0 else 0,
+                'chase_rate': w_ch / w_oz if w_oz > 0 else 0,
+                'csw_rate':   (w_cstr + w_wh) / n_eff if n_eff > 0 else 0,
             }
         return rep
 
@@ -496,38 +540,50 @@ class BatterProfile:
 
     def _zone_map(self, df):
         out = {}
+        w = recency_weights(df)
         for zone in list(range(1,10)) + [11,12,13,14]:
             g = df[df['zone'] == zone]
             if len(g) < 3: continue
-            n  = len(g)
+            wg    = w.loc[g.index]
+            n_eff = wg.sum()
             sw = g[g['description'].isin(SWING_DESC)]
             wh = g[g['description'].isin(WHIFF_DESC)]
             hi = g[g['description'].str.contains('hit_into_play', na=False)]
             hh = hi[hi['launch_speed'] >= 95] if 'launch_speed' in hi.columns else pd.DataFrame()
+            w_sw = wg.loc[sw.index].sum() if len(sw) > 0 else 0
+            w_wh = wg.loc[wh.index].sum() if len(wh) > 0 else 0
+            w_hi = wg.loc[hi.index].sum() if len(hi) > 0 else 0
+            w_hh = wg.loc[hh.index].sum() if len(hh) > 0 else 0
             out[int(zone)] = {
-                'n':          n,
-                'swing_rate': len(sw) / n,
-                'whiff_rate': len(wh) / len(sw) if len(sw) > 0 else 0,
-                'hard_hit':   len(hh) / len(hi) if len(hi) > 0 else 0,
+                'n':          len(g),
+                'swing_rate': w_sw / n_eff if n_eff > 0 else 0,
+                'whiff_rate': w_wh / w_sw if w_sw > 0 else 0,
+                'hard_hit':   w_hh / w_hi if w_hi > 0 else 0,
                 'pitchcom':   ZONE_TO_PITCHCOM.get(zone, {}).get('dir', 'Middle'),
             }
         return out
 
     def _pt_map(self, df):
         out = {}
+        w = recency_weights(df)
         for pt, g in df.groupby('pitch_type'):
             if pt not in PITCH_TYPES or len(g) < 5: continue
-            n  = len(g)
+            wg    = w.loc[g.index]
+            n_eff = wg.sum()
             sw = g[g['description'].isin(SWING_DESC)]
             wh = g[g['description'].isin(WHIFF_DESC)]
             oz = g[g['zone'].isin([11,12,13,14])]
             ch = oz[oz['description'].isin(SWING_DESC)]
+            w_sw = wg.loc[sw.index].sum() if len(sw) > 0 else 0
+            w_wh = wg.loc[wh.index].sum() if len(wh) > 0 else 0
+            w_oz = wg.loc[oz.index].sum() if len(oz) > 0 else 0
+            w_ch = wg.loc[ch.index].sum() if len(ch) > 0 else 0
             out[pt] = {
                 'name':       PITCH_TYPES[pt],
-                'n':          n,
-                'swing_rate': len(sw) / n,
-                'whiff_rate': len(wh) / len(sw) if len(sw) > 0 else 0,
-                'chase_rate': len(ch) / len(oz) if len(oz) > 0 else 0,
+                'n':          len(g),
+                'swing_rate': w_sw / n_eff if n_eff > 0 else 0,
+                'whiff_rate': w_wh / w_sw if w_sw > 0 else 0,
+                'chase_rate': w_ch / w_oz if w_oz > 0 else 0,
             }
         return out
 
@@ -573,6 +629,36 @@ class BatterProfile:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HEAD-TO-HEAD MATCHUP PROFILE
+# ─────────────────────────────────────────────────────────────────────────────
+class MatchupProfile:
+    """Head-to-head stats for a specific pitcher-batter matchup."""
+
+    def __init__(self, h2h_data: Optional[pd.DataFrame]):
+        self.has_data = h2h_data is not None and len(h2h_data) >= 5
+        if not self.has_data:
+            self.pitch_type_results = {}
+            self.n_abs = 0
+            self.n_pitches = 0
+            return
+        df = h2h_data
+        self.n_pitches = len(df)
+        self.n_abs = df['at_bat_number'].nunique() if 'at_bat_number' in df.columns else 0
+        self.pitch_type_results = {}
+        for pt, g in df.groupby('pitch_type'):
+            sw  = g[g['description'].isin(SWING_DESC)]
+            wh  = g[g['description'].isin(WHIFF_DESC)]
+            hip = g[g['description'].str.contains('hit_into_play', na=False)]
+            hh  = hip[hip['launch_speed'] >= 95] if 'launch_speed' in hip.columns else pd.DataFrame()
+            self.pitch_type_results[pt] = {
+                'n':             len(g),
+                'whiff_rate':    len(wh) / len(sw) if len(sw) > 0 else 0,
+                'hard_hit_rate': len(hh) / len(hip) if len(hip) > 0 else 0,
+                'contact_rate':  len(hip) / len(sw) if len(sw) > 0 else 0,
+            }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RULE-BASED ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 class RuleEngine:
@@ -592,14 +678,20 @@ class RuleEngine:
         'CH': ['FF','FT','SL'],
     }
 
-    def __init__(self, pitcher: PitcherProfile, batter: BatterProfile):
+    def __init__(self, pitcher: PitcherProfile, batter: BatterProfile,
+                 matchup_profile: MatchupProfile = None):
         self.pitcher = pitcher
         self.batter  = batter
+        self.matchup = matchup_profile
+        self.batter_stands  = batter.stands       # 'L', 'R', or 'S'
+        self.pitcher_throws = pitcher.handedness   # 'L' or 'R'
+        self.same_side = (self.pitcher_throws == self.batter_stands) or \
+                         (self.batter_stands == 'S' and self.pitcher_throws == 'R')
         self._vulns  = {(v['pitch_type'], v['zone']): v
                         for v in batter.vulnerabilities()[:30]}
 
     def recommend(self, count: str, prev_pitches: List[dict],
-                  leverage: float = 1.0) -> List[dict]:
+                  leverage: float = 1.0, game_state: dict = None) -> List[dict]:
         """Return top-10 ranked recommendations for the current pitch."""
         recs  = []
         last  = prev_pitches[-1] if prev_pitches else None
@@ -612,7 +704,7 @@ class RuleEngine:
                 freq = zdist.get(float(zone), zdist.get(zone, 0))
                 if freq < 0.02:
                     continue
-                sc, reasons = self._score(pt, zone, count, last, prev_pitches, ps)
+                sc, reasons = self._score(pt, zone, count, last, prev_pitches, ps, game_state)
                 recs.append({
                     'pitch_type':   pt,
                     'pitch_name':   PITCH_TYPES.get(pt, pt),
@@ -629,7 +721,7 @@ class RuleEngine:
         recs.sort(key=lambda x: -x['score'])
         return self._pressure_adjust(recs, leverage)[:10]
 
-    def _score(self, pt, zone, count, last, prev_pitches, ps):
+    def _score(self, pt, zone, count, last, prev_pitches, ps, game_state=None):
         sc, reasons = 0.0, []
         sc += ps['whiff_rate'] * 30
         sc += ps['csw_rate']   * 20
@@ -649,7 +741,27 @@ class RuleEngine:
             sc += s; reasons.extend(r)
         s, r = self._zone_rules(pt, zone, bz, bp)
         sc += s; reasons.extend(r)
+        if game_state:
+            s, r = self._situation_rules(pt, zone, game_state, ps)
+            sc += s; reasons.extend(r)
+        s, r = self._h2h_rules(pt, zone)
+        sc += s; reasons.extend(r)
         return sc, reasons
+
+    def _h2h_rules(self, pt, zone):
+        sc, r = 0.0, []
+        if not self.matchup or not self.matchup.has_data:
+            return sc, r
+        h2h = self.matchup.pitch_type_results.get(pt)
+        if not h2h or h2h['n'] < 3:
+            return sc, r
+        if h2h['whiff_rate'] > 0.35:
+            sc += 12
+            r.append(f'[H2H] Batter whiffs {h2h["whiff_rate"]*100:.0f}% on {pt} in this matchup')
+        elif h2h['whiff_rate'] < 0.10 and h2h['hard_hit_rate'] > 0.30:
+            sc -= 10
+            r.append(f'[H2H] Batter crushes {pt} in this matchup — consider avoiding')
+        return sc, r
 
     def _count_rules(self, pt, zone, count, ps):
         sc, r = 0.0, []
@@ -691,10 +803,26 @@ class RuleEngine:
                 sc += 8; r.append(f'Repeat {pt} — batter missed it, go back')
             elif lr in ('ball','hit_into_play'):
                 sc -= 15; r.append(f'Avoid repeating {pt} to same zone (last: {lr})')
-        if lz in [1,4,7] and zone in [3,6,9]:   sc += 8;  r.append('Tunnel: inside → away')
-        if lz in [3,6,9] and zone in [1,4,7]:   sc += 8;  r.append('Tunnel: away → inside')
+        # Handedness-aware horizontal tunnels
+        if self.batter_stands == 'L':
+            inside_zones = [3, 6, 9]
+            away_zones   = [1, 4, 7]
+        else:  # R or S (default to RHH)
+            inside_zones = [1, 4, 7]
+            away_zones   = [3, 6, 9]
+
+        if lz in inside_zones and zone in away_zones:
+            sc += 10; r.append(f'Tunnel: inside → away vs {"LHH" if self.batter_stands == "L" else "RHH"}')
+        if lz in away_zones and zone in inside_zones:
+            bonus = 12 if self.same_side else 8
+            sc += bonus
+            r.append(f'Tunnel: away → inside{"  (same-side — extra deceptive)" if self.same_side else ""}')
+        if lz in away_zones and zone in away_zones and lz != zone:
+            sc += 5; r.append('Vertical tunnel on glove side')
+
+        # Handedness-independent vertical tunnels
         if lz in [1,2,3] and zone in [7,8,9,11,12]: sc += 10; r.append('Eye level: high → low')
-        if lz in [7,8,9] and zone in [1,2,3]:   sc += 10; r.append('Eye level: low → high')
+        if lz in [7,8,9] and zone in [1,2,3]:       sc += 10; r.append('Eye level: low → high')
         if lr in ('swinging_strike','swinging_strike_blocked') and lz == zone:
             sc += 12; r.append('Batter whiffed here — exploit again')
         if lr == 'ball' and pt == lt:
@@ -719,6 +847,51 @@ class RuleEngine:
             sc += 15; r.append(f"Zone {zone} is batter's weak spot ({bz['whiff_rate']*100:.0f}% whiff)")
         if bz.get('hard_hit',0) > 0.25:
             sc -= 12; r.append(f"Zone {zone} is batter's power zone — avoid")
+        return sc, r
+
+    def _situation_rules(self, pt, zone, gs, ps):
+        sc, r = 0.0, []
+        on_1b = gs.get('on_1b')
+        on_2b = gs.get('on_2b')
+        on_3b = gs.get('on_3b')
+        outs  = gs.get('outs', 0)
+        inning = gs.get('inning', 1)
+
+        # A) Runner on 3B, less than 2 outs — need ground ball
+        if on_3b and outs < 2:
+            if pt in ('FT', 'SI') and zone in [7, 8, 9]:
+                sc += 15; r.append('Runner on 3rd <2 outs: need ground ball — sinker down')
+            if pt == 'FC' and zone in [7, 4]:
+                sc += 8; r.append('Runner on 3rd <2 outs: cutter low-in for ground ball')
+            if pt == 'FF' and zone in [1, 2, 3]:
+                sc -= 10; r.append('Avoid fly ball risk with runner on 3rd')
+            if pt == 'CH' and zone in [1, 2, 3]:
+                sc -= 5; r.append('Avoid high changeup with runner on 3rd')
+
+        # B) Runner on 1B only — steal threat
+        if on_1b and not on_2b and not on_3b:
+            if pt in ('FF', 'SI', 'FT'):
+                sc += 5; r.append('Runner on 1st: quick pitch to plate — limits steal')
+            if pt in ('CU', 'KC'):
+                sc -= 5; r.append('Slow pitch — runner may steal')
+
+        # C) Bases loaded — avoid walks at all cost
+        if on_1b and on_2b and on_3b:
+            if zone in [11, 12, 13, 14]:
+                sc -= 8; r.append('Bases loaded: avoid walks at all cost')
+            if 1 <= zone <= 9 and ps.get('csw_rate', 0) > 0.30:
+                sc += 10; r.append(f'Bases loaded: high-CSW pitch in zone ({ps["csw_rate"]*100:.0f}% CSW)')
+
+        # D) Bases empty, early inning — attack
+        if not on_1b and not on_2b and not on_3b and inning <= 3:
+            if 1 <= zone <= 9:
+                sc += 3; r.append('Early/bases empty: attack the zone')
+
+        # E) 2 outs — strikeout ends the inning
+        if outs == 2:
+            if ps.get('whiff_rate', 0) > 0.30:
+                sc += 5; r.append('2 outs: strikeout ends the inning')
+
         return sc, r
 
     def _pressure_adjust(self, recs, lev):
@@ -954,6 +1127,70 @@ class PitchOutcomeModel:
             c['ml_prob']           = c['ml_favorable_prob']  # backward compat
         return candidates
 
+    def train_blender(self, pitcher_data: pd.DataFrame, rule_engine: 'RuleEngine'):
+        """Train a logistic regression that combines rule score + ML prob to predict outcome."""
+        df = pitcher_data[pitcher_data['pitch_type'].notna()].copy()
+        df = df.sort_values(['game_pk', 'at_bat_number', 'pitch_number'])
+
+        blender_X = []
+        blender_y = []
+
+        for (_gm, _ab), group in df.groupby(['game_pk', 'at_bat_number']):
+            prev_pitches = []
+            for idx, row in group.iterrows():
+                pt   = row['pitch_type']
+                zone = row.get('zone', 5)
+                count = f"{int(row.get('balls',0))}-{int(row.get('strikes',0))}"
+
+                # Rule engine score for this actual pitch
+                try:
+                    recs = rule_engine.recommend(count, prev_pitches, leverage=1.0)
+                    match = [r for r in recs if r['pitch_type'] == pt and r['zone'] == int(zone)]
+                    rule_score = match[0]['score'] if match else 0.0
+                except Exception:
+                    rule_score = 0.0
+
+                # ML probability
+                if self.is_trained:
+                    try:
+                        ctx_row = {**row.to_dict(), 'pitch_type': pt, 'zone': zone}
+                        X_row = self._featurize(pd.DataFrame([ctx_row]))[self.feat_cols].fillna(0)
+                        ml_prob = float(self.model.predict_proba(X_row)[0, 1]) if X_row.shape[0] > 0 else 0.5
+                    except Exception:
+                        ml_prob = 0.5
+                else:
+                    ml_prob = 0.5
+
+                # Target: was this pitch outcome favorable for the pitcher?
+                desc   = row.get('description', '')
+                events = row.get('events', '')
+                favorable = 1 if (desc in FAVORABLE_DESC or events in FAVORABLE_EVENTS) else 0
+
+                blender_X.append([rule_score, ml_prob, rule_score * ml_prob])
+                blender_y.append(favorable)
+
+                prev_pitches.append({'type': pt, 'zone': int(zone), 'result': desc})
+
+        if len(blender_X) < 50:
+            self.blender = None
+            return
+
+        X_b = np.array(blender_X)
+        y_b = np.array(blender_y)
+
+        self.blender = LogisticRegression(max_iter=500)
+        self.blender.fit(X_b, y_b)
+
+        coefs = self.blender.coef_[0]
+        print(f'  Blender weights: rule={coefs[0]:.3f}, ml={coefs[1]:.3f}, interaction={coefs[2]:.3f}')
+
+    def blend_score(self, rule_score: float, ml_prob: float) -> float:
+        """Combine rule score and ML probability using learned weights."""
+        if not hasattr(self, 'blender') or self.blender is None:
+            return rule_score + ml_prob * 20  # fallback
+        X = np.array([[rule_score, ml_prob, rule_score * ml_prob]])
+        return float(self.blender.predict_proba(X)[0, 1]) * 100
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REAL-TIME AT-BAT TRACKER
@@ -1069,6 +1306,85 @@ class AtBatTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GAME MEMORY — CROSS-AB PATTERN TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+class GameMemory:
+    """Tracks cross-AB patterns within a game for the same batter."""
+
+    def __init__(self):
+        self.ab_history: List[dict] = []
+
+    def record_ab(self, ab_tracker: AtBatTracker):
+        summary = {
+            'result': ab_tracker.result,
+            'pitches': [
+                {'pt': p.pt, 'zone': p.zone, 'result': p.result}
+                for p in ab_tracker.history
+            ],
+            'pitch_types_seen': list(set(p.pt for p in ab_tracker.history)),
+            'whiff_pitches': [
+                p.pt for p in ab_tracker.history
+                if 'swinging_strike' in p.result
+            ],
+            'hit_pitches': [
+                p.pt for p in ab_tracker.history
+                if p.result == 'hit_into_play' and p.events not in (
+                    'field_out', 'grounded_into_double_play',
+                    'force_out', 'fielders_choice', 'fielders_choice_out')
+            ],
+            'balls_on': [
+                p.pt for p in ab_tracker.history
+                if p.result == 'ball'
+            ],
+        }
+        self.ab_history.append(summary)
+
+    def adjustments(self) -> List[dict]:
+        if not self.ab_history:
+            return []
+
+        adjustments = []
+        whiff_counts: Dict[str, int] = defaultdict(int)
+        hit_counts:   Dict[str, int] = defaultdict(int)
+        fp_counts:    Dict[str, int] = defaultdict(int)
+
+        for ab in self.ab_history:
+            for pt in ab['whiff_pitches']:
+                whiff_counts[pt] += 1
+            for pt in ab['hit_pitches']:
+                hit_counts[pt] += 1
+            if ab['pitches']:
+                fp_counts[ab['pitches'][0]['pt']] += 1
+
+        for pt, count in whiff_counts.items():
+            if count >= 2:
+                adjustments.append({
+                    'pitch_type': pt,
+                    'boost': +10,
+                    'note': f'[GAME MEMORY] {pt} generated {count} whiffs in prior ABs — keep using it',
+                })
+
+        for pt, count in hit_counts.items():
+            if count >= 1:
+                adjustments.append({
+                    'pitch_type': pt,
+                    'boost': -8,
+                    'note': f'[GAME MEMORY] Batter hit {pt} for a hit in prior AB — adjust location or avoid',
+                })
+
+        for pt, count in fp_counts.items():
+            if count >= 2:
+                adjustments.append({
+                    'pitch_type': pt,
+                    'boost': -5,
+                    'note': f'[GAME MEMORY] Batter saw {pt} as first pitch {count}x — change the look',
+                    'first_pitch_only': True,
+                })
+
+        return adjustments
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PERFECT PITCH AI — MAIN ORCHESTRATOR
 # ─────────────────────────────────────────────────────────────────────────────
 class PerfectPitchAI:
@@ -1081,6 +1397,7 @@ class PerfectPitchAI:
         self.ml       = PitchOutcomeModel()
         self.ab:      Optional[AtBatTracker]   = None
         self._pdata   = None
+        self.game_memory = GameMemory()
 
     def load_matchup(self, pitcher_name: str, batter_name: str,
                      pitcher_id: int = None, batter_id: int = None):
@@ -1112,7 +1429,18 @@ class PerfectPitchAI:
             except Exception as e:
                 print(f'ML training failed: {e} — rule-based only')
 
-        self.rules = RuleEngine(self.pitcher, self.batter)
+        h2h_data = self.fetcher.get_matchup_data(pitcher_id, batter_id, pitcher_name, batter_name)
+        self.matchup_profile = MatchupProfile(h2h_data)
+        if self.matchup_profile.has_data:
+            print(f'  H2H history: {self.matchup_profile.n_pitches} pitches across {self.matchup_profile.n_abs} ABs')
+
+        self.rules = RuleEngine(self.pitcher, self.batter, matchup_profile=self.matchup_profile)
+
+        try:
+            self.ml.train_blender(self._pdata, self.rules)
+        except Exception as e:
+            print(f'  Blender training failed: {e}')
+
         print(f'Ready: {pitcher_name} vs {batter_name}')
 
     def start_at_bat(self, inning=1, outs=0, on_base='___',
@@ -1134,13 +1462,29 @@ class PerfectPitchAI:
         lev  = self.ab.leverage
         prev = self.ab.prev_dict()
 
-        recs = self.rules.recommend(self.ab.count, prev, lev)
+        gs = {
+            'outs':  self.ab.gs.get('outs', 0),
+            'on_1b': self.ab.gs.get('on_1b'),
+            'on_2b': self.ab.gs.get('on_2b'),
+            'on_3b': self.ab.gs.get('on_3b'),
+            'inning': self.ab.gs.get('inning', 1),
+        }
+        recs = self.rules.recommend(self.ab.count, prev, lev, game_state=gs)
 
         rt = self.ab.rt_adjustments()
         for rec in recs:
             if rec['pitch_type'] in rt:
                 rec['score'] += rt[rec['pitch_type']]['boost']
                 rec['reasons'].append(rt[rec['pitch_type']]['note'])
+
+        gm_adj = self.game_memory.adjustments()
+        for rec in recs:
+            for adj in gm_adj:
+                if adj['pitch_type'] == rec['pitch_type']:
+                    if adj.get('first_pitch_only') and self.ab.pitch_num != 1:
+                        continue
+                    rec['score'] += adj['boost']
+                    rec['reasons'].append(adj['note'])
 
         _last = self.ab.history[-1] if self.ab.history else None
         ctx = {'balls': self.ab.balls, 'strikes': self.ab.strikes,
@@ -1161,16 +1505,12 @@ class PerfectPitchAI:
                'pitch_number':       self.ab.pitch_num}
         recs = self.ml.score_candidates(recs, ctx)
         for rec in recs:
-            if 'ml_whiff_prob' in rec:
-                rec['score'] += rec['ml_whiff_prob']  * 25
-                rec['score'] += rec['ml_strike_prob'] * 15
-                rec['score'] -= rec['ml_ball_prob']   * 10
-                rec['score'] -= rec['ml_inplay_prob'] *  5
-                whiff_pct  = rec['ml_whiff_prob']  * 100
-                strike_pct = rec['ml_strike_prob'] * 100
-                if whiff_pct + strike_pct > 30:
+            if 'ml_prob' in rec:
+                rec['blended_score'] = self.ml.blend_score(rec['score'], rec['ml_prob'])
+                rec['score'] = rec['blended_score']
+                if rec.get('ml_prob', 0) > 0.55:
                     rec['reasons'].append(
-                        f"[ML] {whiff_pct:.0f}% whiff / {strike_pct:.0f}% called-strike probability"
+                        f"[ML+RULES] Blended score: {rec['blended_score']:.1f}"
                     )
         recs.sort(key=lambda x: -x['score'])
 
@@ -1188,3 +1528,8 @@ class PerfectPitchAI:
             loc=ZONE_TO_PITCHCOM.get(zone, {}).get('dir', 'Middle'),
             result=result, events=events, velocity=velocity)
         self.ab.record(pr)
+        if self.ab.complete:
+            self.game_memory.record_ab(self.ab)
+
+    def reset_game_memory(self):
+        self.game_memory = GameMemory()

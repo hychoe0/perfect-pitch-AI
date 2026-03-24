@@ -269,6 +269,13 @@ def reset_at_bat():
     return {'status': 'reset'}
 
 
+@app.post('/api/game/reset_memory')
+def reset_game_memory():
+    _require_ready()
+    state.ai.reset_game_memory()
+    return {'status': 'memory_cleared'}
+
+
 @app.get('/api/constants')
 def constants():
     return {
