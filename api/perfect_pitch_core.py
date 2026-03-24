@@ -17,7 +17,7 @@ import pybaseball
 pybaseball.cache.enable()
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, classification_report
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 # ── Seasons ───────────────────────────────────────────────────────────────────
@@ -399,7 +399,7 @@ def batter_pressure_profile(df: pd.DataFrame) -> dict:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────���──────────────────────────────────────
 # PITCHER PROFILE
 # ──────────────────────��──────────────────────────────────────────��───────────
 class PitcherProfile:
@@ -746,9 +746,10 @@ class RuleEngine:
 class PitchOutcomeModel:
 
     def __init__(self):
-        self.model      = None
-        self.feat_cols  = []
-        self.is_trained = False
+        self.model       = None
+        self.feat_cols   = []
+        self.is_trained  = False
+        self.class_names = ['whiff', 'called_strike', 'foul', 'ball', 'in_play']
 
     @staticmethod
     def _col(df: pd.DataFrame, col: str, default=0) -> pd.Series:
@@ -793,27 +794,36 @@ class PitchOutcomeModel:
         return d.fillna(0)
 
     def _target(self, df: pd.DataFrame) -> pd.Series:
-        return (
-            df['description'].isin(FAVORABLE_DESC) |
-            df['events'].isin(FAVORABLE_EVENTS)
-        ).astype(int)
+        desc = df['description']
+        cat = pd.Series(index=df.index, dtype='Int64')
+        cat[desc.isin({'swinging_strike', 'swinging_strike_blocked'})] = 0
+        cat[desc == 'called_strike']                                    = 1
+        cat[desc.isin({'foul', 'foul_tip'})]                           = 2
+        cat[desc.isin({'ball', 'blocked_ball'})]                       = 3
+        cat[desc.str.contains('hit_into_play', na=False)]              = 4
+        return cat.dropna().astype(int)
 
     def train(self, pitcher_data: pd.DataFrame):
         df = pitcher_data[pitcher_data['pitch_type'].notna()].copy()
         print(f'  Building features for {len(df):,} pitches...')
         X = self._featurize(df)
-        y = self._target(df)
-        valid = y.notna()
-        X, y  = X[valid], y[valid]
-        print(f'  Favorable outcome rate: {y.mean()*100:.1f}%')
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y)
+        y = self._target(df.loc[X.index])
+        X = X.loc[y.index]
+        print(f'  Class distribution: { {k: int((y==v).sum()) for k,v in zip(self.class_names, range(5))} }')
+        try:
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y)
+        except ValueError:
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X, y, test_size=0.2, random_state=42)
         self.model = HistGradientBoostingClassifier(
             max_iter=300, max_depth=6, learning_rate=0.05,
             min_samples_leaf=20, random_state=42)
         self.model.fit(X_tr, y_tr)
         acc = accuracy_score(y_te, self.model.predict(X_te))
         print(f'  Test accuracy: {acc:.3f}')
+        print(classification_report(y_te, self.model.predict(X_te),
+                                    target_names=self.class_names, zero_division=0))
         self.feat_cols  = list(X.columns)
         self.is_trained = True
         return self
@@ -824,9 +834,15 @@ class PitchOutcomeModel:
         rows  = [{**ctx, 'pitch_type': c['pitch_type'], 'zone': c['zone']}
                  for c in candidates]
         X     = self._featurize(pd.DataFrame(rows))[self.feat_cols].fillna(0)
-        probs = self.model.predict_proba(X)[:, 1]
-        for c, p in zip(candidates, probs):
-            c['ml_prob'] = float(p)
+        probs = self.model.predict_proba(X)           # shape (n, 5)
+        for i, c in enumerate(candidates):
+            c['ml_whiff_prob']     = float(probs[i, 0])
+            c['ml_strike_prob']    = float(probs[i, 1])
+            c['ml_foul_prob']      = float(probs[i, 2])
+            c['ml_ball_prob']      = float(probs[i, 3])
+            c['ml_inplay_prob']    = float(probs[i, 4])
+            c['ml_favorable_prob'] = float(probs[i, 0] + probs[i, 1])
+            c['ml_prob']           = c['ml_favorable_prob']  # backward compat
         return candidates
 
 
@@ -1021,10 +1037,17 @@ class PerfectPitchAI:
                'release_speed': 93}
         recs = self.ml.score_candidates(recs, ctx)
         for rec in recs:
-            if 'ml_prob' in rec:
-                rec['score'] += rec['ml_prob'] * 20
-                if rec['ml_prob'] > 0.55:
-                    rec['reasons'].append(f"[ML] {rec['ml_prob']*100:.0f}% favorable outcome probability")
+            if 'ml_whiff_prob' in rec:
+                rec['score'] += rec['ml_whiff_prob']  * 25
+                rec['score'] += rec['ml_strike_prob'] * 15
+                rec['score'] -= rec['ml_ball_prob']   * 10
+                rec['score'] -= rec['ml_inplay_prob'] *  5
+                whiff_pct  = rec['ml_whiff_prob']  * 100
+                strike_pct = rec['ml_strike_prob'] * 100
+                if whiff_pct + strike_pct > 30:
+                    rec['reasons'].append(
+                        f"[ML] {whiff_pct:.0f}% whiff / {strike_pct:.0f}% called-strike probability"
+                    )
         recs.sort(key=lambda x: -x['score'])
 
         return recs[:top_n]
